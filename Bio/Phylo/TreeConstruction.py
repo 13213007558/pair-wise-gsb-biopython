@@ -10,6 +10,7 @@
 import itertools
 import copy
 import numbers
+from math import isclose
 from Bio.Phylo import BaseTree
 from Bio.Align import Alignment, MultipleSeqAlignment
 from Bio.Align import substitution_matrices
@@ -1061,16 +1062,59 @@ class ParsimonyScorer(Scorer):
 
     :Parameters:
         matrix : _Matrix
-            scoring matrix used in parsimony score calculation.
+            scoring matrix used in parsimony score calculation.  Any
+            matrix-like object providing its alphabet through a `names`
+            or `alphabet` attribute and the substitution cost of two
+            states `a` and `b` through `matrix[a, b]` is accepted,
+            e.g. a :class:`Bio.Align.substitution_matrices.Array`; this
+            allows asymmetric substitution costs.
 
     """
 
     def __init__(self, matrix=None):
         """Initialize the class."""
-        if not matrix or isinstance(matrix, _Matrix):
+        if matrix is None or isinstance(matrix, _Matrix):
+            self.matrix = matrix
+        elif hasattr(matrix, "__getitem__") and (
+            hasattr(matrix, "names") or hasattr(matrix, "alphabet")
+        ):
+            # matrix-like object, e.g. a substitution_matrices.Array,
+            # possibly with asymmetric substitution costs
             self.matrix = matrix
         else:
             raise TypeError("Must provide a _Matrix object.")
+
+    @staticmethod
+    def _sorted_terminals(tree, alignment):
+        """Sort the terminal clades and the alignment, and check them (PRIVATE).
+
+        Return the terminal clades of the tree sorted by name; the
+        alignment is sorted in place so that its rows match the clades.
+        """
+        terms = tree.get_terminals()
+        terms.sort(key=lambda term: term.name)
+        alignment.sort()
+        if isinstance(alignment, MultipleSeqAlignment):
+            sequences = alignment
+        else:  # Alignment object
+            sequences = alignment.sequences
+        if not all(t.name == s.id for t, s in zip(terms, sequences)):
+            raise ValueError(
+                "Taxon names of the input tree should be the same with the alignment."
+            )
+        return terms
+
+    def _get_alphabet(self):
+        """Return the alphabet of the scoring matrix (PRIVATE)."""
+        names = getattr(self.matrix, "names", None)
+        if names is None:
+            names = getattr(self.matrix, "alphabet", None)
+        if names is None:
+            raise TypeError(
+                "The scoring matrix should provide its alphabet "
+                "through a 'names' or 'alphabet' attribute."
+            )
+        return list(names)
 
     def get_score(self, tree, alignment):
         """Calculate parsimony score using the Fitch algorithm.
@@ -1085,19 +1129,7 @@ class ParsimonyScorer(Scorer):
         if not tree.rooted:
             tree.root_at_midpoint()
         # sort tree terminals and alignment
-        terms = tree.get_terminals()
-        terms.sort(key=lambda term: term.name)
-        alignment.sort()
-        if isinstance(alignment, MultipleSeqAlignment):
-            if not all(t.name == a.id for t, a in zip(terms, alignment)):
-                raise ValueError(
-                    "Taxon names of the input tree should be the same with the alignment."
-                )
-        else:  # Alignment object
-            if not all(t.name == s.id for t, s in zip(terms, alignment.sequences)):
-                raise ValueError(
-                    "Taxon names of the input tree should be the same with the alignment."
-                )
+        terms = self._sorted_terminals(tree, alignment)
         # term_align = dict(zip(terms, alignment))
         score = 0
         for i in range(len(alignment[0])):
@@ -1112,7 +1144,7 @@ class ParsimonyScorer(Scorer):
             # start calculating score_i using the tree and column_i
 
             # Fitch algorithm without the penalty matrix
-            if not self.matrix:
+            if self.matrix is None:
                 # init by mapping terminal clades and states in column_i
                 clade_states = dict(zip(terms, [{c} for c in column_i]))
                 for clade in tree.get_nonterminals(order="postorder"):
@@ -1128,7 +1160,7 @@ class ParsimonyScorer(Scorer):
             else:
                 inf = float("inf")
                 # init score arrays for terminal clades
-                alphabet = self.matrix.names
+                alphabet = self._get_alphabet()
                 length = len(alphabet)
                 clade_scores = {}
                 for j in range(len(column_i)):
@@ -1159,6 +1191,191 @@ class ParsimonyScorer(Scorer):
                 # TODO: resolve internal states
             score += score_i
         return score
+
+    def get_states(self, tree, alignment):
+        """Calculate the optimal ancestral states for each alignment column.
+
+        For each column of the alignment, calculate the minimum parsimony
+        score and the states each ancestral (nonterminal) clade can take
+        in at least one globally optimal reconstruction, i.e. a most
+        parsimonious assignment of states to all ancestral clades.  States
+        that are merely optimal for the subtree below a clade, but cannot
+        be extended to a globally optimal reconstruction, are not included.
+
+        The calculation uses the Sankoff algorithm with dynamic
+        programming tables shared by all clades of the tree (a postorder
+        pass followed by a preorder pass per column), so the cost stays
+        proportional to the number of clades even when the number of
+        optimal reconstructions grows exponentially; complete ancestral
+        sequences are never enumerated.
+
+        :Parameters:
+            tree : Tree
+                tree on which the states are calculated.  The tree may be
+                multifurcating, and is used as rooted at `tree.root`.
+            alignment : MultipleSeqAlignment or Alignment
+                alignment from which the states are calculated.
+
+        :Returns:
+            A list with one entry per alignment column.  Each entry is a
+            tuple `(score, states)` with the minimum parsimony score of
+            the column and a dictionary mapping each nonterminal clade to
+            the set of states it can take in a globally optimal
+            reconstruction.  The clades themselves (not their names) are
+            the dictionary keys, so clades sharing the same name are still
+            distinguished.
+
+        Characters of the alignment that are not part of the alphabet are
+        treated as unknown: the corresponding terminal clade may take any
+        state at no cost.  Whether a gap character `-` counts as an
+        ordinary state is therefore up to the caller: without a scoring
+        matrix every observed character is an ordinary state, while with
+        a scoring matrix exactly the characters of the matrix alphabet
+        are ordinary states.
+
+        Examples
+        --------
+        We reuse the tree and alignment from ParsimonyTreeConstructor::
+
+          >>> from Bio import AlignIO, Phylo
+          >>> aln = AlignIO.read(open('TreeConstruction/msa.phy'), 'phylip')
+          >>> tree = Phylo.read('TreeConstruction/pars3.tre', 'newick')
+          >>> scorer = Phylo.TreeConstruction.ParsimonyScorer()
+          >>> results = scorer.get_states(tree, aln)
+
+        Each entry of the result gives the minimum score of one alignment
+        column and the candidate states of the ancestral clades::
+
+          >>> score, states = results[0]
+          >>> score
+          2
+          >>> for clade in tree.get_nonterminals():
+          ...     print(clade.name, sorted(states[clade]))
+          Inner4 ['A', 'G']
+          Inner1 ['G']
+          Inner3 ['A']
+          Inner2 ['A']
+
+        """
+        terms = self._sorted_terminals(tree, alignment)
+        if self.matrix is None:
+            alphabet = None
+            costs = None
+        else:
+            alphabet = self._get_alphabet()
+            matrix = self.matrix
+            length = len(alphabet)
+            costs = [
+                [matrix[alphabet[m], alphabet[n]] for n in range(length)]
+                for m in range(length)
+            ]
+        results = []
+        for i in range(len(alignment[0])):
+            column_i = alignment[:, i]
+            if alphabet is None:
+                # Fitch algorithm: every observed character is a state
+                column_alphabet = sorted(set(column_i))
+                column_costs = [
+                    [0 if m == n else 1 for n in range(len(column_alphabet))]
+                    for m in range(len(column_alphabet))
+                ]
+            else:
+                column_alphabet = alphabet
+                column_costs = costs
+            results.append(
+                self._get_column_states(
+                    tree, terms, column_i, column_alphabet, column_costs
+                )
+            )
+        return results
+
+    @staticmethod
+    def _get_column_states(tree, terms, column, alphabet, costs):
+        """Calculate the optimal score and ancestral states of one column (PRIVATE).
+
+        `terms` are the terminal clades of `tree`, sorted to match the
+        characters of `column`; `costs[m][n]` is the substitution cost
+        from state `alphabet[m]` to state `alphabet[n]`.  Return a
+        tuple `(score, states)` as described in get_states.
+        """
+        inf = float("inf")
+        length = len(alphabet)
+        index = {letter: k for k, letter in enumerate(alphabet)}
+        # down[clade][k]: minimum score of the subtree rooted at clade,
+        # given that clade takes state k
+        down = {}
+        # contrib[clade][j][m]: minimum score of the subtree rooted at the
+        # j-th child of clade, given that clade takes state m
+        contrib = {}
+        for clade, letter in zip(terms, column):
+            k = index.get(letter)
+            if k is None:
+                # unknown character: any state at no cost
+                down[clade] = [0] * length
+            else:
+                array = [inf] * length
+                array[k] = 0
+                down[clade] = array
+        # postorder pass: score of every subtree
+        for clade in tree.get_nonterminals(order="postorder"):
+            child_contribs = []
+            for child in clade.clades:
+                child_down = down[child]
+                array = [
+                    min(costs[m][n] + child_down[n] for n in range(length))
+                    for m in range(length)
+                ]
+                child_contribs.append(array)
+            contrib[clade] = child_contribs
+            down[clade] = [sum(values) for values in zip(*child_contribs)]
+        root = tree.root
+        best = min(down[root])
+        # up[clade][k]: minimum score of the rest of the tree (everything
+        # not in the subtree rooted at clade), given state k at clade
+        up = {root: [0] * length}
+        # preorder pass: score of the remainder of the tree
+        for clade in tree.get_nonterminals(order="preorder"):
+            children = clade.clades
+            if not children:
+                continue
+            up_clade = up[clade]
+            child_contribs = contrib[clade]
+            count = len(children)
+            # prefix/suffix sums of the child contributions, so that the
+            # dynamic programming tables are shared between the children
+            prefix = [[0] * length]
+            for j in range(count):
+                prefix.append(
+                    [prefix[j][m] + child_contribs[j][m] for m in range(length)]
+                )
+            suffix = [None] * (count + 1)
+            suffix[count] = [0] * length
+            for j in range(count - 1, -1, -1):
+                suffix[j] = [
+                    suffix[j + 1][m] + child_contribs[j][m] for m in range(length)
+                ]
+            for j, child in enumerate(children):
+                base = [
+                    up_clade[m] + prefix[j][m] + suffix[j + 1][m] for m in range(length)
+                ]
+                up[child] = [
+                    min(costs[m][n] + base[m] for m in range(length))
+                    for n in range(length)
+                ]
+        # a state is reported for a clade only if it can be extended to a
+        # globally optimal reconstruction of the whole tree
+        states = {}
+        for clade in tree.get_nonterminals():
+            down_clade = down[clade]
+            up_clade = up[clade]
+            states[clade] = {
+                alphabet[k]
+                for k in range(length)
+                if isclose(
+                    down_clade[k] + up_clade[k], best, rel_tol=1e-9, abs_tol=1e-9
+                )
+            }
+        return best, states
 
 
 class ParsimonyTreeConstructor(TreeConstructor):

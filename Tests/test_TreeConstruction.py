@@ -6,17 +6,22 @@
 """Unit tests for the Bio.Phylo.TreeConstruction module."""
 
 import os
+import random
 import tempfile
 import unittest
 from io import StringIO
-from itertools import combinations
+from itertools import combinations, product
 
 from Bio import Align
 from Bio import AlignIO
 from Bio import Phylo
+from Bio.Align import Alignment, MultipleSeqAlignment
+from Bio.Align import substitution_matrices
 from Bio.Phylo import BaseTree
 from Bio.Phylo import Consensus
 from Bio.Phylo import TreeConstruction
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
 from Bio.Phylo.TreeConstruction import _Matrix
 from Bio.Phylo.TreeConstruction import DistanceCalculator
 from Bio.Phylo.TreeConstruction import DistanceMatrix
@@ -444,6 +449,297 @@ class ParsimonyScorerTest(unittest.TestCase):
         scorer = ParsimonyScorer(matrix)
         score = scorer.get_score(tree, aln)
         self.assertEqual(score, 3 + 1 + 3 + 3 + 2 + 1 + 2 + 5)
+
+
+def _fitch_cost(a, b):
+    """Unit substitution cost used by the Fitch algorithm."""
+    return 0 if a == b else 1
+
+
+def _matrix_cost(matrix):
+    """Return a substitution cost function for a matrix-like object."""
+
+    def cost(a, b):
+        return matrix[a, b]
+
+    return cost
+
+
+def _brute_force_states(tree, column, alphabet, cost):
+    """Ground truth: enumerate all ancestral state assignments.
+
+    Return the minimum parsimony score of the column and, for each
+    nonterminal clade, the set of states the clade takes in at least one
+    globally optimal reconstruction.
+    """
+    terms = tree.get_terminals()
+    terms.sort(key=lambda term: term.name)
+    leaf_letter = dict(zip(terms, column))
+    internals = tree.get_nonterminals(order="postorder")
+    best = None
+    states = {clade: set() for clade in internals}
+    for assignment in product(alphabet, repeat=len(internals)):
+        state = dict(zip(internals, assignment))
+        score = 0
+        for clade in internals:
+            parent = state[clade]
+            for child in clade.clades:
+                if child.is_terminal():
+                    letter = leaf_letter[child]
+                    if letter in alphabet:
+                        score += cost(parent, letter)
+                    else:  # unknown character: any state at no cost
+                        score += min(cost(parent, a) for a in alphabet)
+                else:
+                    score += cost(parent, state[child])
+        if best is None or score < best:
+            best = score
+            states = {clade: {state[clade]} for clade in internals}
+        elif score == best:
+            for clade in internals:
+                states[clade].add(state[clade])
+    return best, states
+
+
+def _make_alignment(names, columns):
+    """Create a MultipleSeqAlignment from names and a list of columns."""
+    records = [
+        SeqRecord(Seq("".join(chars)), id=name)
+        for name, chars in zip(names, zip(*columns))
+    ]
+    return MultipleSeqAlignment(records)
+
+
+def _read_rooted(newick):
+    """Read a newick string and declare the tree rooted at its root."""
+    tree = Phylo.read(StringIO(newick), "newick")
+    tree.rooted = True
+    return tree
+
+
+class ParsimonyScorerStatesTest(unittest.TestCase):
+    """Test ParsimonyScorer.get_states against brute force enumeration."""
+
+    def assert_states(self, scorer, tree, alignment, alphabet=None, cost=None):
+        """Check the get_states result of every column against brute force.
+
+        Return the sum of the column scores for comparison with get_score.
+        """
+        results = scorer.get_states(tree, alignment)
+        self.assertEqual(len(results), len(alignment[0]))
+        total = 0
+        for i, (score, states) in enumerate(results):
+            column = alignment[:, i]
+            if alphabet is None:  # Fitch algorithm
+                column_alphabet = sorted(set(column))
+                column_cost = _fitch_cost
+            else:  # Sankoff algorithm
+                column_alphabet = alphabet
+                column_cost = cost
+            best, expected = _brute_force_states(
+                tree, column, column_alphabet, column_cost
+            )
+            self.assertEqual(score, best)
+            self.assertEqual(set(states), set(expected))
+            for clade, clade_states in states.items():
+                self.assertEqual(clade_states, expected[clade])
+            total += score
+        return total
+
+    def test_fitch(self):
+        tree = _read_rooted("((Alpha,Beta)I1,(Gamma,(Delta,Epsilon)I2)I3)I4;")
+        names = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon"]
+        columns = ["AACGG", "ACGTA", "GGGGG", "ACACA", "TGCAT", "AAGGC"]
+        aln = _make_alignment(names, columns)
+        scorer = ParsimonyScorer()
+        total = self.assert_states(scorer, tree, aln)
+        self.assertEqual(total, scorer.get_score(tree, aln))
+
+    def test_symmetric_matrix(self):
+        tree = _read_rooted("((Alpha,Beta)I1,(Gamma,(Delta,Epsilon)I2)I3)I4;")
+        names = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon"]
+        columns = ["AACGG", "ACGTA", "GGGGG", "ACACA", "TGCAT", "AAGGC"]
+        aln = _make_alignment(names, columns)
+        alphabet = ["A", "T", "C", "G"]
+        step_matrix = [[0], [2, 0], [2, 1, 0], [1, 2, 2, 0]]
+        matrix = _Matrix(alphabet, step_matrix)
+        scorer = ParsimonyScorer(matrix)
+        total = self.assert_states(scorer, tree, aln, alphabet, _matrix_cost(matrix))
+        self.assertEqual(total, scorer.get_score(tree, aln))
+
+    def test_asymmetric_matrix(self):
+        tree = _read_rooted("((Alpha,Beta)I1,(Gamma,(Delta,Epsilon)I2)I3)I4;")
+        names = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon"]
+        columns = ["AACGG", "ACGTA", "GGGGG", "ACACA", "TGCAT", "AAGGC"]
+        aln = _make_alignment(names, columns)
+        matrix = substitution_matrices.Array("ACGT", dims=2)
+        for a in "ACGT":
+            for b in "ACGT":
+                matrix[a, b] = 0
+        for (a, b), value in {
+            ("A", "C"): 3,
+            ("C", "A"): 1,
+            ("A", "G"): 2,
+            ("G", "A"): 4,
+            ("A", "T"): 1,
+            ("T", "A"): 2,
+            ("C", "G"): 5,
+            ("G", "C"): 1,
+            ("C", "T"): 2,
+            ("T", "C"): 3,
+            ("G", "T"): 1,
+            ("T", "G"): 2,
+        }.items():
+            matrix[a, b] = value
+        scorer = ParsimonyScorer(matrix)
+        alphabet = list(matrix.alphabet)
+        total = self.assert_states(scorer, tree, aln, alphabet, _matrix_cost(matrix))
+        self.assertEqual(total, scorer.get_score(tree, aln))
+
+    def test_unknown_characters(self):
+        tree = _read_rooted("((Alpha,Beta)I1,(Gamma,(Delta,Epsilon)I2)I3)I4;")
+        names = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon"]
+        # 'N', '?' and '-' are not part of the matrix alphabet
+        columns = ["NACGG", "AC?TA", "GGG-G", "NCN?A", "T-NT?", "NNNNN"]
+        aln = _make_alignment(names, columns)
+        alphabet = ["A", "T", "C", "G"]
+        step_matrix = [[0], [2, 0], [2, 1, 0], [1, 2, 2, 0]]
+        matrix = _Matrix(alphabet, step_matrix)
+        scorer = ParsimonyScorer(matrix)
+        self.assert_states(scorer, tree, aln, alphabet, _matrix_cost(matrix))
+
+    def test_gap_as_state(self):
+        tree = _read_rooted("((Alpha,Beta)I1,(Gamma,(Delta,Epsilon)I2)I3)I4;")
+        names = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon"]
+        columns = ["-ACGG", "AC-TA", "GGG-G", "A--CA", "TGCAT", "--GG-"]
+        aln = _make_alignment(names, columns)
+        # the caller decides to treat the gap as an ordinary state
+        alphabet = ["A", "T", "C", "G", "-"]
+        step_matrix = [[0], [2, 0], [2, 1, 0], [1, 2, 2, 0], [3, 3, 3, 3, 0]]
+        matrix = _Matrix(alphabet, step_matrix)
+        scorer = ParsimonyScorer(matrix)
+        self.assert_states(scorer, tree, aln, alphabet, _matrix_cost(matrix))
+
+    def test_multifurcating(self):
+        trees = [
+            "((Alpha,Beta,Gamma)I1,(Delta,Epsilon)I2)I3;",
+            "(Alpha,Beta,Gamma,Delta)I1;",
+            "((Alpha,Beta)I1,(Gamma,Delta,Epsilon)I2,Eta)I3;",
+        ]
+        alphabet = ["A", "T", "C", "G"]
+        step_matrix = [[0], [2, 0], [2, 1, 0], [1, 2, 2, 0]]
+        matrix = _Matrix(alphabet, step_matrix)
+        for newick in trees:
+            tree = Phylo.read(StringIO(newick), "newick")
+            names = sorted(term.name for term in tree.get_terminals())
+            columns = [
+                "AACGGT"[: len(names)],
+                "ACGTAC"[: len(names)],
+                "GGGGGG"[: len(names)],
+                "ACACAA"[: len(names)],
+                "TGCATG"[: len(names)],
+            ]
+            for scorer in (ParsimonyScorer(), ParsimonyScorer(matrix)):
+                if scorer.matrix is None:
+                    aln = _make_alignment(names, columns)
+                    self.assert_states(scorer, tree, aln)
+                else:
+                    aln = _make_alignment(names, columns)
+                    self.assert_states(
+                        scorer, tree, aln, alphabet, _matrix_cost(matrix)
+                    )
+
+    def test_duplicate_names(self):
+        # the two internal clades are both named X; the terminal clades
+        # share names with each other as well
+        tree = _read_rooted("((A,A)X,(B,B)X)R;")
+        names = ["A", "A", "B", "B"]
+        columns = ["ACGT", "AGCT", "AAAA"]
+        aln = _make_alignment(names, columns)
+        scorer = ParsimonyScorer()
+        results = scorer.get_states(tree, alignment=aln)
+        for score, states in results:
+            # clades are dictionary keys, so the two X clades are distinct
+            self.assertEqual(len(states), 3)
+            self.assertEqual(len({id(clade) for clade in states}), 3)
+        total = self.assert_states(scorer, tree, aln)
+        self.assertEqual(total, scorer.get_score(tree, aln))
+
+    def test_alignment_class(self):
+        tree = _read_rooted("((Alpha,Beta)I1,(Gamma,(Delta,Epsilon)I2)I3)I4;")
+        names = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon"]
+        columns = ["AACGG", "ACGTA", "GGGGG", "ACACA", "TGCAT", "AAGGC"]
+        records = [
+            SeqRecord(Seq("".join(chars)), id=name)
+            for name, chars in zip(names, zip(*columns))
+        ]
+        aln = Alignment(records)
+        scorer = ParsimonyScorer()
+        total = self.assert_states(scorer, tree, aln)
+        self.assertEqual(total, scorer.get_score(tree, aln))
+
+    def test_random(self):
+        rng = random.Random(42)
+        trees = [
+            "((A,B)I1,(C,(D,E)I2)I3)I4;",
+            "((A,B,C)I1,(D,E)I2)I3;",
+            "(A,(B,C)I1,(D,E)I2)I3;",
+            "((A,B)I1,(C,D)I2,(E,F)I3)I4;",
+            "(A,B,(C,D,E)I1)I2;",
+        ]
+        alphabet = "ACG"
+        for newick in trees:
+            tree = Phylo.read(StringIO(newick), "newick")
+            names = sorted(term.name for term in tree.get_terminals())
+            matrix = substitution_matrices.Array(alphabet, dims=2)
+            for a in alphabet:
+                for b in alphabet:
+                    matrix[a, b] = 0 if a == b else rng.randint(1, 5)
+            scorer = ParsimonyScorer(matrix)
+            for _ in range(10):
+                columns = [
+                    "".join(rng.choice(alphabet + "N") for _ in range(len(names)))
+                    for _ in range(5)
+                ]
+                aln = _make_alignment(names, columns)
+                self.assert_states(
+                    scorer, tree, aln, list(alphabet), _matrix_cost(matrix)
+                )
+
+    def test_large_tree(self):
+        # the dynamic programming tables are shared between clades, so
+        # larger trees are handled without enumerating reconstructions
+        rng = random.Random(7)
+        names = [f"Taxon{i:02d}" for i in range(40)]
+        clades = [BaseTree.Clade(name=name) for name in names]
+        rng.shuffle(clades)
+        while len(clades) > 1:
+            child1 = clades.pop(rng.randrange(len(clades)))
+            child2 = clades.pop(rng.randrange(len(clades)))
+            clades.append(BaseTree.Clade(clades=[child1, child2]))
+        tree = BaseTree.Tree(clades[0])
+        alphabet = ["A", "T", "C", "G"]
+        step_matrix = [[0], [2, 0], [2, 1, 0], [1, 2, 2, 0]]
+        matrix = _Matrix(alphabet, step_matrix)
+        # no unknown characters here, so that get_score can be used as reference
+        columns = ["".join(rng.choice("ACGT") for _ in names) for _ in range(30)]
+        aln = _make_alignment(names, columns)
+        scorer = ParsimonyScorer(matrix)
+        results = scorer.get_states(tree, aln)
+        self.assertEqual(len(results), 30)
+        for score, states in results:
+            self.assertEqual(len(states), 39)
+            for clade_states in states.values():
+                self.assertTrue(clade_states)
+                self.assertLessEqual(clade_states, set(alphabet))
+        total = sum(score for score, states in results)
+        self.assertEqual(total, scorer.get_score(tree, aln))
+
+    def test_name_mismatch(self):
+        tree = Phylo.read(StringIO("((A,B)I1,C)I2;"), "newick")
+        aln = _make_alignment(["A", "B", "D"], ["ACG", "AGT"])
+        scorer = ParsimonyScorer()
+        self.assertRaises(ValueError, scorer.get_states, tree, aln)
 
 
 class NNITreeSearcherTest(unittest.TestCase):
