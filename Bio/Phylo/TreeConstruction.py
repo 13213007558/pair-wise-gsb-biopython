@@ -1061,7 +1061,11 @@ class ParsimonyScorer(Scorer):
 
     :Parameters:
         matrix : _Matrix
-            scoring matrix used in parsimony score calculation.
+            scoring matrix used in parsimony score calculation.  This can
+            be a _Matrix object (symmetric costs) or a nested dict
+            ``matrix[ancestral_state][derived_state] -> cost``, which
+            allows asymmetric substitution costs.  If no matrix is given,
+            the Fitch algorithm with unit costs is used.
 
     """
 
@@ -1069,8 +1073,26 @@ class ParsimonyScorer(Scorer):
         """Initialize the class."""
         if not matrix or isinstance(matrix, _Matrix):
             self.matrix = matrix
+        elif isinstance(matrix, dict) and all(
+            isinstance(row, dict) for row in matrix.values()
+        ):
+            # nested dict of substitution costs, may be asymmetric
+            self.matrix = matrix
         else:
-            raise TypeError("Must provide a _Matrix object.")
+            raise TypeError("Must provide a _Matrix object or a nested dict.")
+
+    def _substitution_model(self):
+        """Return the alphabet and substitution cost function (PRIVATE).
+
+        The returned cost function takes the ancestral state and the
+        derived state; it is asymmetric if the scoring matrix was given
+        as a nested dict.
+        """
+        matrix = self.matrix
+        if isinstance(matrix, _Matrix):
+            return list(matrix.names), lambda a, b: matrix[a, b]
+        # nested dict, possibly asymmetric
+        return list(matrix), lambda a, b: matrix[a][b]
 
     def get_score(self, tree, alignment):
         """Calculate parsimony score using the Fitch algorithm.
