@@ -1215,6 +1215,26 @@ The ``SeqIO`` indexing automatically detects the BGZF compression. Note
 that you can’t use the same index file for the uncompressed and
 compressed files.
 
+FASTA region access
+~~~~~~~~~~~~~~~~~~~
+
+For a chromosome-scale FASTA file, reading an entire ``SeqRecord`` just to
+inspect a short region is wasteful. Create a standard ``.fai`` index once,
+and then retrieve only the requested bases. Coordinates are zero-based and
+half-open, like a Python slice:
+
+.. code:: pycon
+
+   >>> from Bio.SeqIO import FastaRangeIO
+   >>> FastaRangeIO.index_fasta("chr1.fa")
+   'chr1.fa.fai'
+   >>> with FastaRangeIO.open_fasta("chr1.fa") as fasta:
+   ...     region = fasta.fetch("chr1", 100, 200)
+   ...     reverse = fasta.fetch("chr1", 100, 200, reverse_complement=True)
+
+For BGZF-compressed FASTA, ``index_fasta`` creates both ``.fai`` and ``.gzi``
+indices. Opening a FASTA file never creates either index automatically.
+
 .. _`sec:SeqIO-indexing-discussion`:
 
 Discussion

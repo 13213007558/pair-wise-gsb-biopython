@@ -18,6 +18,11 @@ Python 3.15 release candidate. It has also been tested on PyPy3.10 v7.3.19, as
 well as Python 3.11+ on Windows for ARM64. Python 3.10 is approaching end of
 life, our support for it is now deprecated.
 
+``Bio.SeqIO.FastaRangeIO`` now provides explicit FASTA ``.fai`` index creation
+and memory-efficient random access to zero-based, half-open sequence regions.
+BGZF-compressed FASTA files use an additional standard ``.gzi`` index, and
+regions can optionally be returned as the reverse complement.
+
 6 August 2026: Biopython 1.88
 =============================
 

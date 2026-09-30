@@ -381,6 +381,7 @@ from Bio import AlignIO
 from Bio.SeqIO import AbiIO
 from Bio.SeqIO import AceIO
 from Bio.SeqIO import FastaIO
+from Bio.SeqIO import FastaRangeIO
 from Bio.SeqIO import GckIO
 from Bio.SeqIO import GfaIO
 from Bio.SeqIO import IgIO  # IntelliGenetics or MASE format
