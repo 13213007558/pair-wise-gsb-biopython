@@ -18,6 +18,13 @@ Python 3.15 release candidate. It has also been tested on PyPy3.10 v7.3.19, as
 well as Python 3.11+ on Windows for ARM64. Python 3.10 is approaching end of
 life, our support for it is now deprecated.
 
+The new module Bio.SeqIO.FastaIndex provides random access to intervals of
+the sequences in a FASTA file, using samtools style indexes (a .fai index
+for plain files, plus a .gzi index for BGZF compressed files).  Indexes are
+created explicitly with the create_index function, after which the
+FastaIntervalReader class can fetch zero-based half-open intervals (with
+optional reverse complementing) without reading whole chromosomes.
+
 6 August 2026: Biopython 1.88
 =============================
 
